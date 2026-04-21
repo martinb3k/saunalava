@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Carpenter 3D Viewer</title>
+  <style>
+    :root {
+      --bg: #f2f2ef;
+      --panel: rgba(255, 255, 255, 0.92);
+      --text: #1f2937;
+      --accent: #2b7a0b;
+      --accent-2: #9a3412;
+      --danger: #b91c1c;
+      --border: rgba(0, 0, 0, 0.15);
+      --shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+      --radius: 14px;
+    }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      touch-action: none;
+      overflow: hidden;
+    }
+
+    #app {
+      position: fixed;
+      inset: 0;
+    }
+
+    #viewer {
+      position: absolute;
+      inset: 0;
+    }
+
+    .hud {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      display: grid;
+      gap: 10px;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    .panel {
+      pointer-events: auto;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(6px);
+      padding: 10px;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 12px;
+      min-height: 54px;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: white;
+      padding: 10px 12px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    #measureBtn {
+      background: var(--accent);
+    }
+
+    #measureBtn.active {
+      background: var(--accent-2);
+    }
+
+    #clearBtn {
+      background: var(--danger);
+    }
+
+    .status {
+      line-height: 1.35;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+
+    .hint {
+      font-size: 0.85rem;
+      opacity: 0.85;
+      margin-top: 6px;
+      font-weight: 500;
+    }
+
+    .top-badge {
+      position: absolute;
+      top: max(10px, env(safe-area-inset-top));
+      left: 12px;
+      right: 12px;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-block;
+      max-width: 100%;
+      background: rgba(31, 41, 55, 0.85);
+      color: #fff;
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      box-shadow: var(--shadow);
+    }
+
+    @media (min-width: 760px) {
+      .hud {
+        left: 16px;
+        right: auto;
+        width: min(420px, 44vw);
+      }
+
+      button {
+        min-height: 50px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <canvas id="viewer"></canvas>
+
+    <div class="top-badge">
+      <div class="badge" id="modeBadge">Loading model…</div>
+    </div>
+
+    <div class="hud">
+      <div class="panel controls">
+        <button id="measureBtn" aria-pressed="false">Measure Faces</button>
+        <button id="clearBtn">Clear</button>
+      </div>
+
+      <div class="panel status" id="statusText">
+        Preparing viewer…
+        <div class="hint">
+          1 finger: rotate · 2 fingers: zoom/pan. In measure mode, tap two parallel faces.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const canvas = document.getElementById('viewer');
+    const statusText = document.getElementById('statusText');
+    const measureBtn = document.getElementById('measureBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const modeBadge = document.getElementById('modeBadge');
+
+    const MODEL_PATH = 'lava_str.glb';
+    const MODEL_URL = new URL(MODEL_PATH, document.baseURI).toString();
+    const MODEL_LABEL = MODEL_URL.replace(window.location.origin, '');
+    const PROBE_TIMEOUT_MS = 8000;
+    let modelLoaded = false;
+
+    const setFatalStatus = (badgeText, message, error) => {
+      modeBadge.textContent = badgeText;
+      statusText.firstChild.textContent = message;
+      if (error) console.error(error);
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf2f2ef);
+
+    let renderer;
+    try {
+      const gl = canvas.getContext('webgl2') || canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) {
+        throw new Error('WebGL is not available in this browser environment.');
+      }
+
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+    } catch (error) {
+      setFatalStatus('Render Error', 'WebGL initialization failed. 3D model cannot be displayed in this browser.', error);
+      throw error;
+    }
+
+    const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.01, 4000);
+    camera.position.set(2.4, 1.7, 2.8);
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x8b8b8b, 1.0);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(3, 5, 4);
+    scene.add(dir);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.screenSpacePanning = true;
+    controls.minDistance = 0.05;
+    controls.maxDistance = 500;
+    controls.touches.ONE = THREE.TOUCH.ROTATE;
+    controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    const pickableMeshes = [];
+    const selection = [];
+    let measureMode = false;
+
+    const markerGroup = new THREE.Group();
+    scene.add(markerGroup);
+
+    const makePaletteColor = (index, total) => {
+      const hue = (index / Math.max(total, 1) + 0.07) % 1;
+      return new THREE.Color().setHSL(hue, 0.62, 0.55);
+    };
+
+    const clearMarkers = () => {
+      while (markerGroup.children.length) {
+        const c = markerGroup.children.pop();
+        c.geometry?.dispose?.();
+        c.material?.dispose?.();
+      }
+      selection.length = 0;
+      updateStatus('Measurement cleared. Tap two parallel faces.');
+      modeBadge.textContent = measureMode ? 'Measure Mode ON' : 'View Mode';
+    };
+
+    const updateStatus = (text) => {
+      statusText.firstChild.textContent = text;
+    };
+
+    const failLoading = (reason, details) => {
+      const detailText = details ? ` (${details})` : '';
+      console.error(`[GLB Loader] ${reason}`, details || '');
+      modeBadge.textContent = 'Load Error';
+      updateStatus(`${reason}${detailText}`);
+    };
+
+    window.addEventListener('error', (event) => {
+      failLoading('Script error in viewer', event.message || 'Unknown error');
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const msg = event?.reason?.message || String(event.reason || 'Unknown promise rejection');
+      failLoading('Unhandled promise rejection', msg);
+    });
+
+    const faceDataFromHit = (hit) => {
+      const mesh = hit.object;
+      const geom = mesh.geometry;
+      const pos = geom.attributes.position;
+      const index = geom.index;
+
+      if (hit.faceIndex == null || !pos) return null;
+
+      const triIndex = hit.faceIndex * 3;
+      const i0 = index ? index.getX(triIndex) : triIndex;
+      const i1 = index ? index.getX(triIndex + 1) : triIndex + 1;
+      const i2 = index ? index.getX(triIndex + 2) : triIndex + 2;
+
+      const a = new THREE.Vector3().fromBufferAttribute(pos, i0).applyMatrix4(mesh.matrixWorld);
+      const b = new THREE.Vector3().fromBufferAttribute(pos, i1).applyMatrix4(mesh.matrixWorld);
+      const c = new THREE.Vector3().fromBufferAttribute(pos, i2).applyMatrix4(mesh.matrixWorld);
+
+      const plane = new THREE.Plane().setFromCoplanarPoints(a, b, c);
+      const centroid = new THREE.Vector3().add(a).add(b).add(c).multiplyScalar(1 / 3);
+
+      return { plane, centroid, mesh, points: [a, b, c] };
+    };
+
+    const addMarker = (position, color) => {
+      const geom = new THREE.SphereGeometry(0.01, 18, 18);
+      const mat = new THREE.MeshBasicMaterial({ color });
+      const sphere = new THREE.Mesh(geom, mat);
+      sphere.position.copy(position);
+      markerGroup.add(sphere);
+      return sphere;
+    };
+
+    const drawMeasurement = (a, b, distance) => {
+      const points = [a.clone(), b.clone()];
+      const geom = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineDashedMaterial({ color: 0x1f2937, dashSize: 0.03, gapSize: 0.02, linewidth: 1 });
+      const line = new THREE.Line(geom, mat);
+      line.computeLineDistances();
+      markerGroup.add(line);
+
+      updateStatus(`Distance: ${distance.toFixed(1)} mm (${(distance / 25.4).toFixed(2)} in)`);
+      modeBadge.textContent = `Measured: ${distance.toFixed(1)} mm`;
+    };
+
+    const tryMeasure = () => {
+      if (selection.length < 2) return;
+
+      const [f1, f2] = selection;
+      const n1 = f1.plane.normal.clone().normalize();
+      const n2 = f2.plane.normal.clone().normalize();
+      const alignment = n1.dot(n2);
+
+      if (Math.abs(alignment) < 0.985) {
+        updateStatus('Selected faces are not parallel enough. Pick two coplanar/parallel faces.');
+        modeBadge.textContent = 'Measure Mode ON';
+        selection.length = 0;
+        return;
+      }
+
+      if (alignment < 0) {
+        n2.negate();
+      }
+
+      const signedDist = f2.centroid.clone().sub(f1.centroid).dot(n1);
+      const dist = Math.abs(signedDist);
+
+      const start = f1.centroid.clone();
+      const end = f1.centroid.clone().add(n1.multiplyScalar(signedDist));
+
+      addMarker(start, 0x9a3412);
+      addMarker(end, 0x9a3412);
+      drawMeasurement(start, end, dist * 1000); // meters -> mm
+
+      selection.length = 0;
+    };
+
+    const pickFace = (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const clientX = event.clientX ?? (event.touches && event.touches[0]?.clientX);
+      const clientY = event.clientY ?? (event.touches && event.touches[0]?.clientY);
+      if (clientX == null || clientY == null) return;
+
+      pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(pickableMeshes, false);
+      if (!hits.length) return;
+
+      const info = faceDataFromHit(hits[0]);
+      if (!info) return;
+
+      addMarker(info.centroid, 0x2b7a0b);
+      selection.push(info);
+
+      if (selection.length === 1) {
+        updateStatus('First face selected. Tap second parallel face.');
+      }
+
+      if (selection.length === 2) {
+        tryMeasure();
+      }
+    };
+
+    const setMeasureMode = (enabled) => {
+      measureMode = enabled;
+      measureBtn.classList.toggle('active', enabled);
+      measureBtn.setAttribute('aria-pressed', String(enabled));
+      modeBadge.textContent = enabled ? 'Measure Mode ON' : 'View Mode';
+      updateStatus(enabled ? 'Measure mode active. Tap two parallel faces.' : 'View mode active. Rotate/zoom/pan with touch gestures.');
+      controls.enabled = !enabled;
+      selection.length = 0;
+    };
+
+    measureBtn.addEventListener('click', () => setMeasureMode(!measureMode));
+    clearBtn.addEventListener('click', clearMarkers);
+
+    let touchStart = null;
+    canvas.addEventListener('touchstart', (e) => {
+      if (!measureMode || e.touches.length !== 1) return;
+      touchStart = {
+        x: e.touches[0].clientX,
+        y: e.touches[0].clientY,
+        t: Date.now()
+      };
+    }, { passive: true });
+
+    canvas.addEventListener('touchend', (e) => {
+      if (!measureMode || !touchStart) return;
+      const dt = Date.now() - touchStart.t;
+      const dx = (e.changedTouches[0].clientX - touchStart.x);
+      const dy = (e.changedTouches[0].clientY - touchStart.y);
+      const moved = Math.hypot(dx, dy);
+      if (dt < 280 && moved < 12) {
+        pickFace(e.changedTouches[0]);
+      }
+      touchStart = null;
+    }, { passive: true });
+
+    canvas.addEventListener('click', (e) => {
+      if (!measureMode) return;
+      pickFace(e);
+    });
+
+    const loadingManager = new THREE.LoadingManager();
+    loadingManager.onStart = () => {
+      modeBadge.textContent = 'Loading model…';
+      updateStatus(`Requesting ${MODEL_LABEL || MODEL_URL}…`);
+    };
+    loadingManager.onProgress = (_, loaded, total) => {
+      updateStatus(`Loading resources: ${loaded}/${total}`);
+    };
+    loadingManager.onError = (url) => {
+      failLoading('Failed to download required asset', url);
+    };
+    loadingManager.onLoad = () => {
+      if (!modelLoaded) {
+        failLoading('Assets finished loading but model callback was not reached');
+      }
+    };
+
+    const loader = new GLTFLoader(loadingManager);
+
+    const fetchWithTimeout = async (url, options = {}, timeoutMs = PROBE_TIMEOUT_MS) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...options, signal: controller.signal });
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    };
+
+    const probeModelFile = async () => {
+      // Prefer HEAD for low bandwidth, but fall back to GET because some servers block HEAD with HTTP 405.
+      try {
+        const headRes = await fetchWithTimeout(MODEL_URL, { method: 'HEAD', cache: 'no-store' });
+        if (headRes.ok) {
+          return {
+            ok: true,
+            status: headRes.status,
+            source: 'HEAD',
+            contentLength: headRes.headers.get('content-length')
+          };
+        }
+
+        if (headRes.status !== 405 && headRes.status !== 501) {
+          return {
+            ok: false,
+            status: headRes.status,
+            source: 'HEAD'
+          };
+        }
+
+        console.warn(`[GLB Loader] HEAD not allowed for ${MODEL_URL}. Retrying probe with GET.`);
+      } catch (error) {
+        if (error?.name !== 'AbortError') {
+          console.warn(`[GLB Loader] HEAD probe failed for ${MODEL_URL}. Retrying with GET.`, error);
+        }
+      }
+
+      const getRes = await fetchWithTimeout(MODEL_URL, { method: 'GET', cache: 'no-store' });
+      return {
+        ok: getRes.ok,
+        status: getRes.status,
+        source: 'GET',
+        contentLength: getRes.headers.get('content-length')
+      };
+    };
+
+    const startModelLoad = async () => {
+      try {
+        const probe = await probeModelFile();
+        if (!probe.ok) {
+          failLoading(`Model file is not reachable at ${MODEL_LABEL || MODEL_URL}`, `HTTP ${probe.status} (${probe.source})`);
+          return;
+        }
+
+        const contentLength = probe.contentLength;
+        const sizeKb = contentLength ? `${Math.round(Number(contentLength) / 1024)} KB` : 'size unknown';
+        updateStatus(`Model file found (${sizeKb}) via ${probe.source}. Parsing GLB…`);
+      } catch (error) {
+        failLoading(`Could not access ${MODEL_LABEL || MODEL_URL}`, error?.message || String(error));
+        return;
+      }
+
+      const loadTimeout = window.setTimeout(() => {
+        if (!modelLoaded) {
+          failLoading('Model load timed out', `Could not finish loading ${MODEL_LABEL || MODEL_URL} in 20s`);
+        }
+      }, 20000);
+
+      loader.load(MODEL_URL, (gltf) => {
+        modelLoaded = true;
+        window.clearTimeout(loadTimeout);
+
+        const root = gltf.scene;
+        scene.add(root);
+
+        root.updateWorldMatrix(true, true);
+
+        const meshes = [];
+        root.traverse((obj) => {
+          if (obj.isMesh && obj.geometry) meshes.push(obj);
+        });
+
+        if (!meshes.length) {
+          failLoading('Model loaded but contains no mesh geometry');
+          return;
+        }
+
+        meshes.forEach((mesh, i) => {
+          mesh.geometry.computeVertexNormals();
+          const color = makePaletteColor(i, meshes.length);
+          mesh.material = new THREE.MeshStandardMaterial({
+            color,
+            metalness: 0.06,
+            roughness: 0.77,
+            side: THREE.DoubleSide
+          });
+
+          const edges = new THREE.EdgesGeometry(mesh.geometry, 18);
+          const edgeLines = new THREE.LineSegments(
+            edges,
+            new THREE.LineBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.65 })
+          );
+          edgeLines.renderOrder = 1;
+          mesh.add(edgeLines);
+
+          pickableMeshes.push(mesh);
+        });
+
+        const box = new THREE.Box3().setFromObject(root);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+
+        root.position.sub(center);
+
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const fov = camera.fov * (Math.PI / 180);
+        let camDist = (maxDim * 0.75) / Math.tan(fov / 2);
+        camDist *= 1.45;
+
+        camera.position.set(camDist, camDist * 0.75, camDist);
+        camera.near = Math.max(maxDim / 3000, 0.001);
+        camera.far = Math.max(maxDim * 12, 1000);
+        camera.updateProjectionMatrix();
+
+        controls.target.set(0, 0, 0);
+        controls.minDistance = maxDim * 0.08;
+        controls.maxDistance = maxDim * 12;
+        controls.update();
+
+        modeBadge.textContent = 'View Mode';
+        updateStatus(`Model loaded. Meshes colored: ${meshes.length}.`);
+      }, undefined, (err) => {
+        window.clearTimeout(loadTimeout);
+        const message = err?.message || err?.toString?.() || 'Unknown GLTF loader error';
+        failLoading(`Could not load ${MODEL_LABEL || MODEL_URL}`, message);
+      });
+    };
+
+    startModelLoad();
+
+    const onResize = () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    };
+    window.addEventListener('resize', onResize);
+
+    const tick = () => {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    };
+    tick();
+  </script>
+</body>
+</html>
